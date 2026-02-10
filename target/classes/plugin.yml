@@ -1,0 +1,14 @@
+name: NameMob
+version: 1.0.0
+main: pl.jaruso99.namemob.NameMob
+api-version: 1.16
+author: jaruso99
+commands:
+  mob:
+    description: Main command for NameMob
+    permission: namemob.admin
+    usage: /mob tool
+permissions:
+  namemob.admin:
+    description: Allows use of /mob tool
+    default: op
