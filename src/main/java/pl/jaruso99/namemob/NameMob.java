@@ -2,11 +2,15 @@ package pl.jaruso99.namemob;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.Iterator;
 import java.util.List;
+import java.util.UUID;
 
-import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.command.Command;
@@ -14,13 +18,16 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemFlag;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -30,17 +37,28 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
 
+    private static final long MAX_PENDING_AGE_NANOS = 2_500_000_000L;
+    private static final double MAX_MATCH_DISTANCE_SQUARED = 64.0D;
+    private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
+
     private NamespacedKey spawnedByKey;
     private NamespacedKey spawnedByUuidKey;
     private NamespacedKey spawnTimeKey;
+    private NamespacedKey mobToolKey;
+
+    // Krotka kolejka zdarzen uzycia spawn egg; bez map i bez skanowania graczy.
+    private final Deque<EggUseContext> pendingEggUses = new ArrayDeque<>();
 
     @Override
     public void onEnable() {
         spawnedByKey = new NamespacedKey(this, "spawned_by");
         spawnedByUuidKey = new NamespacedKey(this, "spawned_by_uuid");
         spawnTimeKey = new NamespacedKey(this, "spawn_time");
+        mobToolKey = new NamespacedKey(this, "moblog_tool");
 
-        getCommand("mob").setExecutor(this);
+        if (getCommand("mob") != null) {
+            getCommand("mob").setExecutor(this);
+        }
         getServer().getPluginManager().registerEvents(this, this);
     }
 
@@ -55,22 +73,22 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
 
         if (args.length == 0) {
             player.sendMessage(ChatColor.DARK_AQUA + "--- NameMob Help ---");
-            player.sendMessage(ChatColor.AQUA + "/mob tool " + ChatColor.WHITE + "- Daje narzędzie do sprawdzania mobów");
+            player.sendMessage(ChatColor.AQUA + "/mob tool " + ChatColor.WHITE + "- Daje narzedzie do sprawdzania mobow");
             return true;
         }
 
         if (args.length == 1 && args[0].equalsIgnoreCase("tool")) {
             if (!player.hasPermission("namemob.admin")) {
-                player.sendMessage(ChatColor.RED + "Nie masz uprawnień!");
+                player.sendMessage(ChatColor.RED + "Nie masz uprawnien!");
                 return true;
             }
 
             player.getInventory().addItem(getMobTool());
-            player.sendMessage(ChatColor.BLUE + "Otrzymałeś moblog tool!");
+            player.sendMessage(ChatColor.BLUE + "Otrzymales moblog tool!");
             return true;
         }
 
-        player.sendMessage(ChatColor.RED + "Użycie: /mob tool");
+        player.sendMessage(ChatColor.RED + "Uzycie: /mob tool");
         return true;
     }
 
@@ -80,11 +98,12 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
         if (meta != null) {
             meta.setDisplayName(ChatColor.BLUE + "moblog");
             List<String> lore = new ArrayList<>();
-            lore.add(ChatColor.GRAY + "Użyj na mobie, aby sprawdzić");
-            lore.add(ChatColor.GRAY + "kto i kiedy go zrespił.");
+            lore.add(ChatColor.GRAY + "Uzyj na mobie, aby sprawdzic");
+            lore.add(ChatColor.GRAY + "kto i kiedy go zrespil.");
             meta.setLore(lore);
             meta.addEnchant(Enchantment.LUCK, 1, true);
             meta.addItemFlags(ItemFlag.HIDE_ENCHANTS);
+            meta.getPersistentDataContainer().set(mobToolKey, PersistentDataType.BYTE, (byte) 1);
             item.setItemMeta(meta);
         }
         return item;
@@ -95,7 +114,7 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
         ItemStack item = event.getItemDrop().getItemStack();
         if (isMobTool(item)) {
             event.getItemDrop().remove();
-            event.getPlayer().sendMessage(ChatColor.RED + "Twój moblog tool został usunięty!");
+            event.getPlayer().sendMessage(ChatColor.RED + "Twoj moblog tool zostal usuniety!");
         }
     }
 
@@ -104,51 +123,68 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
             return false;
         }
         ItemMeta meta = item.getItemMeta();
-        return meta != null && meta.getDisplayName().equals(ChatColor.BLUE + "moblog");
+        return meta != null
+                && meta.getPersistentDataContainer().has(mobToolKey, PersistentDataType.BYTE)
+                && (ChatColor.BLUE + "moblog").equals(meta.getDisplayName());
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerInteract(PlayerInteractEvent event) {
+        if (event.getHand() != EquipmentSlot.HAND) {
+            return;
+        }
+
+        Action action = event.getAction();
+        if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) {
+            return;
+        }
+
+        ItemStack item = event.getItem();
+        if (item == null || !isSpawnEgg(item.getType())) {
+            return;
+        }
+
+        long now = System.nanoTime();
+        cleanupOldContexts(now);
+
+        Location interactionLocation = event.getClickedBlock() != null
+                ? event.getClickedBlock().getLocation().add(0.5D, 0.5D, 0.5D)
+                : event.getPlayer().getLocation();
+
+        pendingEggUses.addLast(new EggUseContext(
+                event.getPlayer().getUniqueId(),
+                event.getPlayer().getName(),
+                event.getPlayer().getWorld().getUID(),
+                interactionLocation,
+                now));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onSpawn(CreatureSpawnEvent event) {
-        // sprawdzamy czy mob powstał z spawn egg
         if (event.getSpawnReason() != CreatureSpawnEvent.SpawnReason.SPAWNER_EGG) {
             return;
         }
 
-        LivingEntity entity = event.getEntity();
-        Player spawner = null;
-        double nearest = 10.0;
+        long now = System.nanoTime();
+        cleanupOldContexts(now);
 
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            // pomijamy graczy z innych światów
-            if (!p.getWorld().equals(entity.getWorld())) {
-                continue;
-            }
-
-            double dist = p.getLocation().distance(entity.getLocation());
-
-            if (dist < nearest) {
-                nearest = dist;
-                spawner = p;
-            }
-        }
-
-        // jeśli nie znaleziono gracza
-        if (spawner == null) {
+        EggUseContext matchedContext = findAndConsumeContext(event.getEntity().getLocation(), event.getEntity().getWorld().getUID(), now);
+        if (matchedContext == null) {
             return;
         }
 
-        // zapis danych w mobie
-        PersistentDataContainer data = entity.getPersistentDataContainer();
-
-        data.set(spawnedByKey, PersistentDataType.STRING, spawner.getName());
-        data.set(spawnedByUuidKey, PersistentDataType.STRING, spawner.getUniqueId().toString());
-
-        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
-        data.set(spawnTimeKey, PersistentDataType.STRING, dtf.format(LocalDateTime.now()));
+        PersistentDataContainer data = event.getEntity().getPersistentDataContainer();
+        data.set(spawnedByKey, PersistentDataType.STRING, matchedContext.playerName);
+        data.set(spawnedByUuidKey, PersistentDataType.STRING, matchedContext.playerUuid.toString());
+        data.set(spawnTimeKey, PersistentDataType.STRING, DATE_TIME_FORMATTER.format(LocalDateTime.now()));
     }
 
     @EventHandler
     public void onInteract(PlayerInteractEntityEvent event) {
+        if (event.getHand() != EquipmentSlot.HAND) {
+            return;
+        }
+
         Player player = event.getPlayer();
         ItemStack item = player.getInventory().getItemInMainHand();
 
@@ -168,4 +204,70 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
             }
         }
     }
+
+    private EggUseContext findAndConsumeContext(Location spawnLocation, UUID worldUuid, long now) {
+        EggUseContext singleWorldCandidate = null;
+        int worldCandidates = 0;
+        Iterator<EggUseContext> iterator = pendingEggUses.descendingIterator();
+
+        while (iterator.hasNext()) {
+            EggUseContext context = iterator.next();
+            if (!context.worldUuid.equals(worldUuid)) {
+                continue;
+            }
+            if (now - context.timestampNanos > MAX_PENDING_AGE_NANOS) {
+                continue;
+            }
+
+            if (context.location.distanceSquared(spawnLocation) <= MAX_MATCH_DISTANCE_SQUARED) {
+                iterator.remove();
+                return context;
+            }
+
+            worldCandidates++;
+            if (singleWorldCandidate == null) {
+                singleWorldCandidate = context;
+            }
+        }
+
+        // Jesli w oknie czasowym byl tylko jeden kandydat z tego swiata,
+        // mozemy przypisac go bez ryzyka pomylenia graczy.
+        if (worldCandidates == 1 && singleWorldCandidate != null) {
+            pendingEggUses.remove(singleWorldCandidate);
+            return singleWorldCandidate;
+        }
+
+        return null;
+    }
+
+    private void cleanupOldContexts(long now) {
+        while (!pendingEggUses.isEmpty()) {
+            EggUseContext first = pendingEggUses.peekFirst();
+            if (first == null || now - first.timestampNanos <= MAX_PENDING_AGE_NANOS) {
+                break;
+            }
+            pendingEggUses.pollFirst();
+        }
+    }
+
+    private boolean isSpawnEgg(Material material) {
+        return material != null && material.name().endsWith("_SPAWN_EGG");
+    }
+
+    private static final class EggUseContext {
+        private final UUID playerUuid;
+        private final String playerName;
+        private final UUID worldUuid;
+        private final Location location;
+        private final long timestampNanos;
+
+        private EggUseContext(UUID playerUuid, String playerName, UUID worldUuid, Location location, long timestampNanos) {
+            this.playerUuid = playerUuid;
+            this.playerName = playerName;
+            this.worldUuid = worldUuid;
+            this.location = location;
+            this.timestampNanos = timestampNanos;
+        }
+    }
 }
+
