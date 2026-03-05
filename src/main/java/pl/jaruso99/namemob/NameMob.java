@@ -1,5 +1,10 @@
 package pl.jaruso99.namemob;
 
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
@@ -23,25 +28,17 @@ import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
-
 public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
 
-    private NamespacedKey ownerKey;
-    private NamespacedKey dateKey;
-    private NamespacedKey locationKey;
-
-    private NamespacedKey typeKey;
+    private NamespacedKey spawnedByKey;
+    private NamespacedKey spawnedByUuidKey;
+    private NamespacedKey spawnTimeKey;
 
     @Override
     public void onEnable() {
-        ownerKey = new NamespacedKey(this, "owner");
-        dateKey = new NamespacedKey(this, "date");
-        locationKey = new NamespacedKey(this, "location");
-        typeKey = new NamespacedKey(this, "type");
+        spawnedByKey = new NamespacedKey(this, "spawned_by");
+        spawnedByUuidKey = new NamespacedKey(this, "spawned_by_uuid");
+        spawnTimeKey = new NamespacedKey(this, "spawn_time");
 
         getCommand("mob").setExecutor(this);
         getServer().getPluginManager().registerEvents(this, this);
@@ -103,45 +100,51 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     private boolean isMobTool(ItemStack item) {
-        if (item == null || item.getType() != Material.DIAMOND_PICKAXE) return false;
+        if (item == null || item.getType() != Material.DIAMOND_PICKAXE) {
+            return false;
+        }
         ItemMeta meta = item.getItemMeta();
         return meta != null && meta.getDisplayName().equals(ChatColor.BLUE + "moblog");
     }
 
     @EventHandler
     public void onSpawn(CreatureSpawnEvent event) {
-        if (event.getSpawnReason() == CreatureSpawnEvent.SpawnReason.SPAWNER_EGG) {
-            LivingEntity entity = event.getEntity();
-            
-            // We need to find the player who used the egg. 
-            // Since CreatureSpawnEvent doesn't directly provide the player for eggs in all versions,
-            // we look for the nearest player within a small radius.
-            Player spawner = null;
-            double nearest = 10.0;
-            for (Player p : Bukkit.getOnlinePlayers()) {
-                double dist = p.getLocation().distance(entity.getLocation());
-                if (dist < nearest) {
-                    nearest = dist;
-                    spawner = p;
-                }
+        // sprawdzamy czy mob powstał z spawn egg
+        if (event.getSpawnReason() != CreatureSpawnEvent.SpawnReason.SPAWNER_EGG) {
+            return;
+        }
+
+        LivingEntity entity = event.getEntity();
+        Player spawner = null;
+        double nearest = 10.0;
+
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            // pomijamy graczy z innych światów
+            if (!p.getWorld().equals(entity.getWorld())) {
+                continue;
             }
 
-            if (spawner != null) {
-                PersistentDataContainer data = entity.getPersistentDataContainer();
-                data.set(ownerKey, PersistentDataType.STRING, spawner.getName());
-                data.set(typeKey, PersistentDataType.STRING, entity.getType().name());
-                
-                DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
-                data.set(dateKey, PersistentDataType.STRING, dtf.format(LocalDateTime.now()));
-                
-                String loc = String.format("X: %d, Y: %d, Z: %d, World: %s", 
-                    entity.getLocation().getBlockX(), 
-                    entity.getLocation().getBlockY(), 
-                    entity.getLocation().getBlockZ(),
-                    entity.getWorld().getName());
-                data.set(locationKey, PersistentDataType.STRING, loc);
+            double dist = p.getLocation().distance(entity.getLocation());
+
+            if (dist < nearest) {
+                nearest = dist;
+                spawner = p;
             }
         }
+
+        // jeśli nie znaleziono gracza
+        if (spawner == null) {
+            return;
+        }
+
+        // zapis danych w mobie
+        PersistentDataContainer data = entity.getPersistentDataContainer();
+
+        data.set(spawnedByKey, PersistentDataType.STRING, spawner.getName());
+        data.set(spawnedByUuidKey, PersistentDataType.STRING, spawner.getUniqueId().toString());
+
+        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
+        data.set(spawnTimeKey, PersistentDataType.STRING, dtf.format(LocalDateTime.now()));
     }
 
     @EventHandler
@@ -154,17 +157,12 @@ public class NameMob extends JavaPlugin implements Listener, CommandExecutor {
             Entity entity = event.getRightClicked();
             PersistentDataContainer data = entity.getPersistentDataContainer();
 
-            if (data.has(ownerKey, PersistentDataType.STRING)) {
-                String owner = data.get(ownerKey, PersistentDataType.STRING);
-                String date = data.get(dateKey, PersistentDataType.STRING);
-                String loc = data.get(locationKey, PersistentDataType.STRING);
-                String type = data.has(typeKey, PersistentDataType.STRING) ? data.get(typeKey, PersistentDataType.STRING) : entity.getType().name();
+            if (data.has(spawnedByKey, PersistentDataType.STRING)) {
+                String owner = data.get(spawnedByKey, PersistentDataType.STRING);
+                String date = data.get(spawnTimeKey, PersistentDataType.STRING);
 
                 player.sendMessage(ChatColor.DARK_AQUA + "--- Mob Info ---");
-                player.sendMessage(ChatColor.AQUA + "Rodzaj moba: " + ChatColor.WHITE + type);
-                player.sendMessage(ChatColor.AQUA + "Zrespiony przez: " + ChatColor.WHITE + owner);
-                player.sendMessage(ChatColor.AQUA + "Data: " + ChatColor.WHITE + date);
-                player.sendMessage(ChatColor.AQUA + "Lokalizacja: " + ChatColor.WHITE + loc);
+                player.sendMessage(ChatColor.AQUA + "Spawned by " + ChatColor.WHITE + owner + ChatColor.AQUA + " at " + ChatColor.WHITE + date);
             } else {
                 player.sendMessage(ChatColor.RED + "Ten mob nie ma zapisanego logu.");
             }
